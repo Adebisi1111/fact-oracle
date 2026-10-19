@@ -89,7 +89,7 @@ an empty page — a verdict derived from a failed fetch is worse than no verdict
 
 ```javascript
 await client.writeContract({
-  address: "0x2DC05665A643820257a339eE447Ce922507f0118",
+  address: "0xC67aB43D69C0c115aE0d06f3aF724F849df3C1D7",
   functionName: "submit_claim",
   args: ["claim-1", "Abuja is the capital of Nigeria.", "https://example.com/page", ""],
   gasLimit: 5000000n,   // REQUIRED — GenLayer cannot estimate gas for nondet writes
@@ -126,10 +126,10 @@ stored verdict untouched.
 sha256 is identical to the committed `contracts/fact_oracle.py`:
 
 ```
-live bytes : 19633
-local bytes: 19633
-live  sha256: 807eb63fbabfce3e7d6b9a9c725f3fbd0f3bb8562d25841b4c4244ae762f96a3
-local sha256: 807eb63fbabfce3e7d6b9a9c725f3fbd0f3bb8562d25841b4c4244ae762f96a3
+live bytes : 19064
+local bytes: 19064
+live  sha256: 55dfd2c1b088179283bb3dd3d8303a2599a13c38cf15017399651fff7d6bad68
+local sha256: 55dfd2c1b088179283bb3dd3d8303a2599a13c38cf15017399651fff7d6bad68
 MATCH      : YES
 ```
 
