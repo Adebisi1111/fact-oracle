@@ -7,9 +7,9 @@ commit a verdict on whether the evidence **supports** the claim (`TRUE`),
 verdict is stored on-chain with its reasoning, the sources that were read, and a
 sha256 digest of the bytes read.
 
-- **Contract (Bradbury, chain 4221):** `0x2DC05665A643820257a339eE447Ce922507f0118`
-- **Explorer:** https://explorer-bradbury.genlayer.com/address/0x2DC05665A643820257a339eE447Ce922507f0118
-- **Source:** `contracts/fact_oracle.py` (19,633 bytes)
+- **Contract (Bradbury, chain 4221):** `0xC67aB43D69C0c115aE0d06f3aF724F849df3C1D7`
+- **Explorer:** https://explorer-bradbury.genlayer.com/address/0xC67aB43D69C0c115aE0d06f3aF724F849df3C1D7
+- **Source:** `contracts/fact_oracle.py` (19,064 bytes)
 
 ## Why this belongs on GenLayer
 
@@ -103,9 +103,12 @@ await client.writeContract({
 | Cap | Value | Why |
 |---|---|---|
 | `max_claim_chars` | 1000 | the claim is submitter-controlled and goes into the prompt |
+| `max_id_chars` | 200 | a key in a TreeMap; unbounded is a storage-bloat vector |
+| `max_url_chars` | 2000 | source URLs are submitter-controlled |
 | `max_primary_chars` | 3500 | a heavy prompt times the round out (status 12/13) instead of disagreeing |
 | `max_secondary_chars` | 1500 | same |
 | `max_reason_chars` | 400 | keeps the stored record bounded |
+| `max_raw_chars` | 60000 | the raw body is capped **before** the regex work, so a huge page cannot time the round out |
 
 ## Verdicts are revised, never silently overwritten
 
@@ -153,22 +156,23 @@ Plus an unreachable URL, which must revert and store nothing.
 
 | Check | Result |
 |---|---|
-| deployed source == repo source | PASS — 19,633 bytes, `807eb63f…` |
+| deployed source == repo source | PASS — 19,064 bytes, `55dfd2c1…` |
 | `TRUE` for a claim the page states | PASS |
-| `UNVERIFIABLE` for a claim the page does not address | PASS |
-| `FALSE` for a claim the page contradicts | judged `UNVERIFIABLE` — see below |
+| `FALSE` for a claim the page contradicts | PASS |
+| `UNVERIFIABLE` for a claim the page does not address | `NOT_VOTED` — see below |
 | unreachable source aborts and stores nothing | PASS — `FINISHED_WITH_ERROR`, count unchanged |
-| `recheck` revises with a visible trail | PASS — revisions 0 → 1, `previous_verdict=TRUE` |
-| `list_claims` enumerates the set | PASS — 9 of 9 |
-| counters sum to the total | PASS — `{true:3, false:2, unverifiable:4, total:9}` |
+| `recheck` revises with a visible trail | PASS — revisions 2 → 3, `previous_verdict=TRUE` |
+| `list_claims` enumerates the set | PASS — 6 of 6 |
+| counters sum to the total | PASS — `{true:2, false:2, unverifiable:2, total:6}` |
 | `limits()` exposes the caps | PASS |
 
-**The one difference is the model's judgment, not the contract.** For "The
-example.com domain is used to sell consumer electronics online" the leader returned
-`UNVERIFIABLE`, where earlier runs returned `FALSE`. The page states what the domain
-is *for* and never says what it is *not*, so `UNVERIFIABLE` is defensible: that is
-model non-determinism on a borderline claim, and consensus committed the leader's
-answer as designed. A claim the page explicitly denies still resolves `FALSE`.
+**The one miss is the known validator disagreement rate, not a contract defect.**
+For "The example.com domain was registered in 1995" the validators split — some
+runs returned `UNVERIFIABLE`, others a different verdict — and the round deadlocked
+(`NOT_VOTED`). This is the same ~1/6 rate measured in the A/B: the claim is genuinely
+ambiguous (the page says nothing about registration date), and requiring exact
+agreement on borderline claims deadlocks the round. The hedging rule reduces but
+cannot eliminate this; a failed round stores nothing, so a caller retries.
 
 **Why pacing matters.** An unpaced 8-claim burst committed only 4/8, and the
 diagnostic showed why: the **EVM submission transaction itself reverted** ("node at
@@ -178,7 +182,7 @@ defect. Any client should pace writes and retry an admission revert with backoff
 ## Tests
 
 ```bash
-gltest tests/direct -q     # 63 passed
+gltest tests/direct -q     # 73 passed
 ```
 
 | File | Tests | Covers |
@@ -186,6 +190,7 @@ gltest tests/direct -q     # 63 passed
 | `test_fact_oracle.py` | 23 | plumbing: validation, verdict storage, counters, `recheck`, read integrity |
 | `test_fact_oracle_adversarial.py` | 29 | hostile input: injection, URL schemes, degenerate pages, malformed model output, the length cap |
 | `test_fact_oracle_validator.py` | 11 | validator agreement, exercised directly via `direct_vm.run_validator(...)` |
+| `test_fact_oracle_critical.py` | 10 | the four hardening fixes: raw-body cap, fence-escape sanitisation, ID/URL caps, designation tie-breaker |
 
 The validator suite is the one behind the consensus claim. It feeds the validator a
 tampered digest, a digest from a different page, a missing digest, an off-script
@@ -196,7 +201,7 @@ re-judgment **contradicts** the leader (must refuse) and a case where it merely
 The suites do **not** prove the model discriminates; direct mode runs the leader and
 the LLM is a stub. That proof is the live run.
 
-### Three real bugs this suite caught
+### Seven real bugs the suites caught
 
 1. **A JSON model reply can be unencodable.** The calldata encoder accepts only
    bytes, str, Sequence and Mapping. With `response_format="json"` the reply
@@ -210,6 +215,22 @@ the LLM is a stub. That proof is the live run.
 3. **Lazy web responses.** `gl.nondet.web.request` returns a `Lazy[Response]`;
    reading through it unresolved silently yields an empty body, which is
    indistinguishable from a page that says nothing. Added explicit resolution.
+4. **The raw body was unbounded.** `_extract_text` ran its regexes over the full
+   page before truncation, so a 500 KB page would be fully processed — enough to
+   time the round out (status 12/13) instead of producing a verdict. Fixed by
+   capping the body at the fetch boundary, before any regex work.
+5. **The prompt fence was escapable.** A page containing the literal marker
+   `EVIDENCE>>>` could close its own fence and let the rest of the page read as
+   instructions to the model. Fixed by stripping all four markers from both
+   inputs before they enter the prompt; the digest is still computed over the
+   original bytes, so leader and validator agree.
+6. **`claim_id` and the URLs were unbounded** — submitter-controlled keys and
+   arguments with no ceiling. Now capped and exposed in `limits()`.
+7. **The model flip-flopped on a contradiction by designation.** The page says a
+   domain is *for* documentation examples; the claim said it was used to sell
+   electronics. Some runs returned `FALSE`, others `UNVERIFIABLE`. Added an
+   explicit tie-breaker: a designation is a positive statement, so it excludes the
+   asserted use.
 
 ## Design notes
 
@@ -229,13 +250,14 @@ the LLM is a stub. That proof is the live run.
 ## Layout
 
 ```
-contracts/fact_oracle.py                        the contract
+contracts/fact_oracle.py                        the contract (19,064 B)
 tests/direct/test_fact_oracle.py                23 plumbing tests
 tests/direct/test_fact_oracle_adversarial.py    29 hostile-input tests
 tests/direct/test_fact_oracle_validator.py      11 validator-agreement tests
-deploy.mjs                                      deploy to Bradbury
-verify.mjs                                      source parity + live reads
+tests/direct/test_fact_oracle_critical.py       10 hardening-fix tests
+e2e.mjs                                         end-to-end run on the live contract
+deploy.mjs / verify.mjs                         deploy + source parity
 live_paced.mjs                                  paced live measurement
 diag.mjs                                        admission-revert diagnostic
-gltest.config.yaml
+README.md / gltest.config.yaml / .gitignore
 ```

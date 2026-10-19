@@ -1,21 +1,8 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
-"""FactOracle — autonomous fact-checking oracle.
-
-Submit a claim plus one or two public URLs; AI validators fetch them and commit a
-verdict on whether the evidence SUPPORTS the claim (TRUE), CONTRADICTS it (FALSE)
-or does not address it (UNVERIFIABLE), storing the reasoning, the sources read and
-a sha256 digest of the bytes read.
-
-Consensus is gl.vm.run_nondet: the leader fetches and judges; every validator
-independently re-fetches AND re-judges, agreeing only if its digest matches and its
-own verdict does not contradict the leader's. A validator that cannot reach the
-source disagrees rather than agreeing blindly. Both inputs are untrusted, so they
-are fenced in the prompt and the model is told never to follow instructions inside
-them. An unreachable source aborts and stores nothing.
-
-Storage is parallel TreeMaps of scalars — no @allow_storage dataclass, which this
-GenVM build accepts at deploy then stores no code. No funds are held or moved.
-"""
+"""FactOracle — autonomous fact-checking oracle: submit a claim and its sources,
+and AI validators commit a TRUE / FALSE / UNVERIFIABLE verdict on-chain.
+Consensus is gl.vm.run_nondet — the leader fetches and judges, every validator
+re-fetches and re-judges. Storage is parallel TreeMaps of scalars, not a dataclass."""
 
 import hashlib
 import json
@@ -25,12 +12,15 @@ from datetime import datetime, timezone
 from genlayer import *
 
 # Every input to the prompt is capped. A heavy prompt times the round out
-# (VALIDATORS_TIMEOUT 12 / LEADER_TIMEOUT 13) instead of producing a disagreement,
-# and the claim is submitter-controlled, so it needs its own ceiling.
+# (VALIDATORS_TIMEOUT 12 / LEADER_TIMEOUT 13) instead of disagreeing, and the
+# claim is submitter-controlled, so it needs its own ceiling.
 MAX_CLAIM_CHARS = 1000
 MAX_PRIMARY_CHARS = 3500
 MAX_SECONDARY_CHARS = 1500
 MAX_REASON_CHARS = 400
+MAX_ID_CHARS = 200
+MAX_URL_CHARS = 2000
+MAX_RAW_CHARS = 60000
 
 VERDICTS = ("TRUE", "FALSE", "UNVERIFIABLE")
 
@@ -45,6 +35,13 @@ def _extract_text(raw_html: str) -> str:
                  ("&#39;", "'"), ("&nbsp;", " ")):
         text = text.replace(a, b)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def _sanitise(text: str) -> str:
+    """Strip fence markers so untrusted content cannot close its own fence."""
+    for marker in ("<<<CLAIM", "CLAIM>>>", "<<<EVIDENCE", "EVIDENCE>>>"):
+        text = text.replace(marker, "")
+    return text
 
 
 def _resolve(response):
@@ -67,15 +64,12 @@ def _resolve(response):
 
 
 def _digest(text: str) -> str:
-    """A stable fingerprint of the fetched evidence."""
+    """Fingerprint of the fetched evidence."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _fetch_raw(url: str) -> str:
-    """Fetch a URL, raising on failure or a non-2xx status.
-
-    Raising is what stops an error page being judged as if it were evidence.
-    """
+    """Fetch a URL, raising on failure or a non-2xx status. The body is capped."""
     response = _resolve(gl.nondet.web.request(url, method="GET"))
     if isinstance(response, dict):
         status = response.get("status")
@@ -85,11 +79,12 @@ def _fetch_raw(url: str) -> str:
         raise ValueError(f"HTTP {status} fetching {url}")
     body = response.body if hasattr(response, "body") else (
         response.get("body", "") if isinstance(response, dict) else str(response))
-    return body.decode("utf-8", errors="replace") if isinstance(body, bytes) else str(body)
+    return (body.decode("utf-8", errors="replace") if isinstance(body, bytes)
+            else str(body))[:MAX_RAW_CHARS]
 
 
 def _gather(primary: str, secondary: str) -> str:
-    """Fetch the evidence pages into one bounded digest. Raises on any failure."""
+    """Fetch the evidence pages into one bounded digest; raises on any failure."""
     evidence = _extract_text(_fetch_raw(primary))[:MAX_PRIMARY_CHARS]
     if secondary:
         extra = _extract_text(_fetch_raw(secondary))[:MAX_SECONDARY_CHARS]
@@ -120,7 +115,7 @@ def _parse_obj(raw) -> dict:
 
 
 def _parse_lines(text: str) -> dict:
-    """Parse the plain-text reply the prompt asks for: a VERDICT line + REASON line."""
+    """Parse the plain-text reply: a VERDICT line plus a REASON line."""
     out = {}
     verdict = re.search(r"VERDICT\s*:\s*(TRUE|FALSE|UNVERIFIABLE)", text, flags=re.IGNORECASE)
     if verdict:
@@ -132,7 +127,7 @@ def _parse_lines(text: str) -> dict:
 
 
 def _normalize(data: dict) -> dict:
-    """Coerce any parsed reply into {verdict, reasoning}, defaulting to the safe value."""
+    """Coerce any parsed reply into {verdict, reasoning}; default is the safe value."""
     verdict = str(data.get("verdict", "")).strip().upper()
     if verdict not in VERDICTS:
         verdict = "UNVERIFIABLE"
@@ -143,17 +138,11 @@ def _normalize(data: dict) -> dict:
 
 
 def _judge(claim: str, evidence: str) -> dict:
-    """Judge one claim against the fetched evidence.
-
-    The reply is PLAIN TEXT, never response_format="json": a JSON reply crosses the
-    calldata boundary as a parsed object, and the encoder takes only
-    bytes/str/Sequence/Mapping — so one float field (a confidence score) makes the
-    whole response unencodable and the verdict is lost. Plain text always crosses.
-    A JSON reply is still understood if the model volunteers one.
-
-    Both inputs are untrusted, so they are fenced and the model is told to treat
-    everything inside the fences as data, never as instructions.
-    """
+    # The reply is PLAIN TEXT, never response_format="json": a JSON reply crosses
+    # the calldata boundary as a parsed object, and the encoder takes only
+    # bytes/str/Sequence/Mapping — so one float field (a confidence score) makes
+    # the whole response unencodable and the verdict is lost. Both inputs are
+    # fenced and sanitised, or a page containing the marker could close its fence.
     prompt = (
         "You are a rigorous fact-checker. Decide whether the EVIDENCE supports or "
         "contradicts the CLAIM.\n\n"
@@ -162,11 +151,11 @@ def _judge(claim: str, evidence: str) -> dict:
         "from the evidence: do not use outside knowledge and do not assume facts "
         "it does not state.\n\n"
         "<<<CLAIM\n"
-        f"{claim}\n"
-        "CLAIM>>>\n\n"
+        + _sanitise(claim) + "\n"
+        + "CLAIM>>>\n\n"
         "<<<EVIDENCE\n"
-        f"{evidence}\n"
-        "EVIDENCE>>>\n\n"
+        + _sanitise(evidence) + "\n"
+        + "EVIDENCE>>>\n\n"
         "Decide:\n"
         "- TRUE: the evidence clearly and directly supports the claim\n"
         "- FALSE: the evidence clearly and directly contradicts the claim\n"
@@ -176,6 +165,8 @@ def _judge(claim: str, evidence: str) -> dict:
         "- The evidence mentions the claim's subject but never states the claim's "
         "assertion: that is UNVERIFIABLE, not TRUE.\n"
         "- The evidence states the opposite of the claim: that is FALSE.\n"
+        "- The evidence designates X for purpose A while the claim asserts X is used "
+        "for purpose B: a designation is a positive statement, so that is FALSE.\n"
         "- Reserve UNVERIFIABLE for evidence that is silent, ambiguous or too thin. "
         "Do not reach for it merely because the answer took some reading.\n\n"
         "Reply with exactly two lines and no other text:\n"
@@ -194,10 +185,6 @@ def _judge(claim: str, evidence: str) -> dict:
 
 
 class FactOracle(gl.Contract):
-    """Autonomous fact-checking oracle: submit a claim and its sources, and a
-    validator committee commits a TRUE / FALSE / UNVERIFIABLE verdict on-chain
-    with the reasoning and the exact URLs it read."""
-
     # claims — parallel TreeMaps keyed by claim_id, scalar values only
     claim_text: TreeMap[str, str]
     claim_source: TreeMap[str, str]
@@ -233,18 +220,10 @@ class FactOracle(gl.Contract):
         return int(datetime.now(timezone.utc).timestamp())
 
     def _consensus(self, claim: str, primary: str, secondary: str) -> dict:
-        """One leader/validator round: fetch the evidence and judge the claim.
-
-        The leader fetches and judges, returning the verdict with a digest of the
-        bytes it read. Every validator re-fetches AND re-judges the same URLs, and
-        agrees only if its digest matches and its own verdict does not contradict
-        the leader's — so neither a fabricated verdict nor one read from a
-        different page can pass.
-
-        A validator that cannot reach the source disagrees rather than agreeing:
-        it has verified nothing, and agreeing would let a leader commit a verdict
-        no other validator reached.
-        """
+        # The leader fetches and judges, returning the verdict with a digest of
+        # the bytes it read. Each validator re-fetches AND re-judges, and agrees
+        # only if its digest matches and its own verdict does not contradict the
+        # leader's. A validator that cannot reach the source disagrees.
         c = claim
         u1 = primary
         u2 = secondary
@@ -276,10 +255,10 @@ class FactOracle(gl.Contract):
             if _digest(evidence) != str(data.get("digest", "")):
                 return False
             mine = _judge(c, evidence).get("verdict")
-            # Only a POSITIVE contrary finding blocks. A run calling a borderline
-            # page UNVERIFIABLE where the leader said TRUE is honest hedging, not
-            # fabrication, and requiring those to match deadlocked the round
-            # (measured 3/6 commits against 6/6). A TRUE/FALSE flip still blocks.
+            # Only a POSITIVE contrary finding blocks: a run calling a thin page
+            # UNVERIFIABLE where the leader said TRUE is honest hedging, and
+            # requiring those to match deadlocked the round (measured 3/6). A
+            # TRUE/FALSE flip still blocks.
             return mine == verdict or mine == "UNVERIFIABLE"
 
         result = gl.vm.run_nondet(leader_fn, validator_fn)
@@ -289,11 +268,8 @@ class FactOracle(gl.Contract):
     @gl.public.write
     def submit_claim(self, claim_id: str, claim_text: str, source_url: str,
                      second_url: str) -> str:
-        """Fact-check a claim against one or two public sources.
-
-        An unreachable source raises and stores nothing, so a claim never carries
-        a verdict derived from a failed fetch.
-        """
+        # Fact-check a claim against one or two public sources. An unreachable
+        # source raises and stores nothing.
         claim_id = str(claim_id).strip()
         if not claim_id:
             raise gl.vm.UserError("claim_id required")
@@ -302,12 +278,18 @@ class FactOracle(gl.Contract):
         claim_text = str(claim_text).strip()
         if not claim_text:
             raise gl.vm.UserError("claim_text required")
+        if len(claim_id) > MAX_ID_CHARS:
+            raise gl.vm.UserError(f"claim_id must be {MAX_ID_CHARS} characters or fewer")
         if len(claim_text) > MAX_CLAIM_CHARS:
             raise gl.vm.UserError(f"claim_text must be {MAX_CLAIM_CHARS} characters or fewer")
         source_url = str(source_url).strip()
+        if len(source_url) > MAX_URL_CHARS:
+            raise gl.vm.UserError(f"source_url must be {MAX_URL_CHARS} characters or fewer")
         if not source_url.startswith(("http://", "https://")):
             raise gl.vm.UserError("source_url must be http(s)")
         second_url = str(second_url).strip()
+        if len(second_url) > MAX_URL_CHARS:
+            raise gl.vm.UserError(f"second_url must be {MAX_URL_CHARS} characters or fewer")
         if second_url and not second_url.startswith(("http://", "https://")):
             raise gl.vm.UserError("second_url must be http(s) or empty")
         if second_url == source_url:
@@ -347,12 +329,8 @@ class FactOracle(gl.Contract):
 
     @gl.public.write
     def recheck(self, claim_id: str) -> str:
-        """Re-run consensus on an existing claim and revise its verdict.
-
-        Public-good path: sources change, so anyone may re-verify a claim. Nothing
-        is overwritten silently — the previous verdict is kept and the revision
-        count incremented, so the change is visible on-chain.
-        """
+        # Re-run consensus on a claim and revise its verdict. Permissionless.
+        # The previous verdict is kept and the revision count incremented.
         claim_id = str(claim_id).strip()
         if self.claim_text.get(claim_id, None) is None:
             raise gl.vm.UserError(f"Claim {claim_id} not found")
@@ -408,7 +386,7 @@ class FactOracle(gl.Contract):
 
     @gl.public.view
     def get_verdict(self, claim_id: str) -> dict:
-        """The auditable part: verdict + reasoning + the sources it was read from."""
+        """The auditable part: verdict, reasoning, and the sources read."""
         claim_id = str(claim_id)
         if self.claim_verdict.get(claim_id, None) is None:
             return {"exists": False}
@@ -424,7 +402,7 @@ class FactOracle(gl.Contract):
 
     @gl.public.view
     def list_claims(self, offset: u256, limit: u256) -> dict:
-        """Page the claim set. `limit` is clamped to 20."""
+        """Page the claim set; `limit` is clamped to 20."""
         start = int(offset)
         total = int(self.claim_count)
         count = min(int(limit), 20)
@@ -443,10 +421,12 @@ class FactOracle(gl.Contract):
 
     @gl.public.view
     def total_claims(self) -> u256:
+        """Claims recorded."""
         return self.claim_count
 
     @gl.public.view
     def verdict_counts(self) -> dict:
+        """Verdict totals."""
         return {
             "true": int(self.count_true),
             "false": int(self.count_false),
@@ -456,6 +436,7 @@ class FactOracle(gl.Contract):
 
     @gl.public.view
     def submitter_stats(self, wallet: str) -> dict:
+        """Claims submitted by one wallet."""
         wallet = str(wallet)
         return {
             "wallet": wallet,
@@ -470,9 +451,13 @@ class FactOracle(gl.Contract):
             "max_primary_chars": MAX_PRIMARY_CHARS,
             "max_secondary_chars": MAX_SECONDARY_CHARS,
             "max_reason_chars": MAX_REASON_CHARS,
+            "max_id_chars": MAX_ID_CHARS,
+            "max_url_chars": MAX_URL_CHARS,
+            "max_raw_chars": MAX_RAW_CHARS,
             "verdicts": list(VERDICTS),
         }
 
     @gl.public.view
     def now(self) -> str:
+        """Contract clock, UTC."""
         return datetime.now(timezone.utc).isoformat()
