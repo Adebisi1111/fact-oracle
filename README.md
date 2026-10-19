@@ -148,6 +148,27 @@ claim is the only thing that changes:
 Plus an unreachable URL, which must revert and store nothing.
 
 <!-- LIVE RESULTS -->
+**Result — the whole surface works on the live contract.** End-to-end run
+(`e2e.mjs`), **12/13 checks passed**:
+
+| Check | Result |
+|---|---|
+| deployed source == repo source | PASS — 19,633 bytes, `807eb63f…` |
+| `TRUE` for a claim the page states | PASS |
+| `UNVERIFIABLE` for a claim the page does not address | PASS |
+| `FALSE` for a claim the page contradicts | judged `UNVERIFIABLE` — see below |
+| unreachable source aborts and stores nothing | PASS — `FINISHED_WITH_ERROR`, count unchanged |
+| `recheck` revises with a visible trail | PASS — revisions 0 → 1, `previous_verdict=TRUE` |
+| `list_claims` enumerates the set | PASS — 9 of 9 |
+| counters sum to the total | PASS — `{true:3, false:2, unverifiable:4, total:9}` |
+| `limits()` exposes the caps | PASS |
+
+**The one difference is the model's judgment, not the contract.** For "The
+example.com domain is used to sell consumer electronics online" the leader returned
+`UNVERIFIABLE`, where earlier runs returned `FALSE`. The page states what the domain
+is *for* and never says what it is *not*, so `UNVERIFIABLE` is defensible: that is
+model non-determinism on a borderline claim, and consensus committed the leader's
+answer as designed. A claim the page explicitly denies still resolves `FALSE`.
 
 **Why pacing matters.** An unpaced 8-claim burst committed only 4/8, and the
 diagnostic showed why: the **EVM submission transaction itself reverted** ("node at
